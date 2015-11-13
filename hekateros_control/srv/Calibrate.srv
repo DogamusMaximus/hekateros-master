@@ -1,0 +1,5 @@
+# Hekateros hekateros_control/Calibrate service
+
+bool force_recalib    # do [not] force recalibration of all joints
+---
+int8 rc               # return code

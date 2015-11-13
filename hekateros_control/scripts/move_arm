@@ -1,0 +1,666 @@
+#! /usr/bin/env python
+ 
+###############################################################################
+#
+# Package:  RoadNarrows Robotics Hekateros Robotic Manipulator Package
+#
+# Link:     https://github.com/roadnarrows-robotics/hekateros
+#
+# ROS Node: move_arm
+#
+# File: move_arm
+#
+## \file 
+##
+## $LastChangedDate$
+## $Rev$
+##
+## \brief Record or play back a set of moves.
+##
+## Note that this node uses the Hekateros publish interface which is different
+## from the follow trajectory actionlib server interface. 
+##
+## The formats of the input/output files are yaml.
+##
+## \author Robin Knight (robin.knight@roadnarrows.com)
+##  
+## \par Copyright:
+##   (C) 2015.  RoadNarrows LLC.\n
+##   (http://www.roadnarrows.com)\n
+##   All Rights Reserved
+##
+# @EulaBegin@
+# @EulaEnd@
+#
+###############################################################################
+
+import sys
+import os
+import time
+import fcntl
+import termios
+import math
+import getopt
+
+import yaml
+
+import roslib; roslib.load_manifest('hekateros_control')
+import rospy
+
+import trajectory_msgs.msg
+from industrial_msgs.msg import RobotMode
+from industrial_msgs.msg import TriState
+
+from hekateros_control.msg import HekRobotStatusExtended
+from hekateros_control.msg import HekJointStateExtended
+from hekateros_control.msg import ServoHealth
+from hekateros_control.msg import HekOpState
+from hekateros_control.srv import Freeze
+from hekateros_control.srv import Release
+
+from hekateros_control.Utils import *
+
+# Application exit codes
+APP_EC_OK   = 0   # success 
+APP_EC_ARGS = 2   # invalid command-line options and/or arguments
+APP_EC_EXEC = 4   # execution failure
+
+# Progress characters
+ProgressChars = ['|', '/', '|', '\\']
+
+
+# ------------------------------------------------------------------------------
+# Exception Class usage
+# ------------------------------------------------------------------------------
+
+##
+## \brief Unit test command-line exception class.
+##
+## Raise usage excpetion.
+##
+class usage(Exception):
+
+  ##
+  ## \brief Constructor.
+  ##
+  ## \param msg   Error message string.
+  ##
+  def __init__(self, msg):
+    ## error message attribute
+    self.msg = msg
+
+
+# ------------------------------------------------------------------------------
+# Class application
+# ------------------------------------------------------------------------------
+
+##
+## \brief Hekateros move arm.
+##
+class application():
+
+  #
+  ## \brief Constructor.
+  #
+  def __init__(self):
+    self._Argv0 = os.path.basename(__file__)
+    self.m_win = None # future gui version
+
+  #
+  ## \brief Print usage error.
+  ##
+  ## \param emsg  Error message string.
+  #
+  def printUsageErr(self, emsg):
+    if emsg:
+      print "%s: %s" % (self._Argv0, emsg)
+    else:
+      print "%s: error" % (self._Argv0)
+    print "Try '%s --help' for more information." % (self._Argv0)
+
+  ## \brief Print Command-Line Usage Message.
+  def printUsage(self):
+    print \
+"""
+usage: %s [OPTIONS] record FILE
+       %s [OPTIONS] play FILE
+       %s --help
+
+Record and playback Hekateros moves.
+
+Options and arguments:
+-a, --auto          : Automatically play through the list of moves.
+                      N/A for recording.
+                        Default: Manually step through moves.
+-l, --loop          : Continuously play through list of moves.
+                      N/A for recording.
+                        Default: Play list only once.
+-t, --time=T        : If auto, then this is the pause time between moves.
+                      On record, each move's pause field is set this value.
+                      On play, if no pause field is found, then this value is
+                      used.
+                        Default: 1.0 second.
+-n, --name=NAME     : Name of recording.
+                      On record, the recording name field is set to this value.
+                        Default: Recording filename.
+-v, --velocity=V    : Velocity in degrees/second of all joints during a move.
+                      On record, all joint velocities are set to this value.
+                        Default: 50.0 degrees/second.
+-x, --xplay=SCALE   : Playback speed scale. velocity = velocity * SCALE.
+                      N/A for recording.
+                        Default: 1.0 x.
+
+-h, --help          : Display this help and exit.
+
+Description:
+For recording, the current Hekateros position is read and any moved joints
+are saved as the next goal position with the given velocity V. 
+The pause time T is appended to FILE after each recorded move.
+
+Record controls:
+%s
+
+For play, the list of moves in FILE is played back, Each move is executed by
+the Hekateros. After the move, play waits for the allotted pause time T (if
+auto) or for user keyboard input.
+
+Play controls:
+%s
+"""  % (self._Argv0, self._Argv0, self._Argv0,
+        self.helpRecordControls(), self.helpPlayControls())
+ 
+  #
+  ## \brief Record keyboard controls help.
+  ##
+  ## \return String
+  #
+  def helpRecordControls(self):
+    return """\
+  'r' | <SPACE>  - Mark current arm position as next move.
+  'q' | <ESC>    - Save and quit.
+  'h'            - List controls."""
+
+  #
+  ## \brief Play keyboard controls help.
+  ##
+  ## \return String
+  #
+  def helpPlayControls(self):
+    return """\
+  'p' | <SPACE>  - Execute next move (ignored if auto).
+  'q' | <ESC>    - Quit playback.
+  'h'            - List controls."""
+
+  #
+  ## \brief Get command-line options
+  ##  
+  ## \param argv          Argument list. If not None, then overrides
+  ##                      command-line arguments.
+  ## \param [out] kwargs  Keyword argument list.  
+  ##
+  ## \return Parsed keyword arguments.
+  #
+  def getOptions(self, argv=None, **kwargs):
+    if argv is None:
+      argv = sys.argv
+
+    self._Argv0 = os.path.basename(kwargs.get('argv0', __file__))
+
+    # defaults
+    kwargs['debug']     = False
+    kwargs['auto']      = False
+    kwargs['loop']      = False
+    kwargs['name']      = ""
+    kwargs['time']      = 1.0
+    kwargs['velocity']  = 50.0
+    kwargs['xplay']     = 1.0
+
+    # parse command-line options
+    try:
+      opts, args = getopt.getopt(argv[1:], "aln:t:v:x:?h",
+          ['auto', 'loop', 'name=', 'time=', 'velocity=', 'xplay=', 'help', ''])
+    except getopt.error, msg:
+      raise usage(msg)
+    for opt, optarg in opts:
+      if opt in ('-h', '--help', '-?'):
+        self.printUsage()
+        sys.exit(APP_EC_OK)
+      elif opt in ('-a', '--auto'):
+        kwargs['auto'] = True
+      elif opt in ('-n', '--name'):
+        kwargs['name'] = optarg
+      elif opt in ('-l', '--loop'):
+        kwargs['loop'] = True
+      elif opt in ('-t', '--time'):
+        try:
+          kwargs['time'] = float(optarg)
+        except ValueError:
+          self.printUsageErr("--time=%s: NaN." % (repr(optarg)))
+          sys.exit(APP_EC_ARGS)
+      elif opt in ('-v', '--velocity'):
+        try:
+          kwargs['velocity'] = float(optarg)
+        except ValueError:
+          self.printUsageErr("--velocity=%s: NaN." % (repr(optarg)))
+          sys.exit(APP_EC_ARGS)
+      elif opt in ('-x', '--xplay'):
+        try:
+          kwargs['xplay'] = float(optarg)
+        except ValueError:
+          self.printUsageErr("--xplay=%s: NaN." % (repr(optarg)))
+          sys.exit(APP_EC_ARGS)
+
+    # check command-line arguments
+    if len(args) < 1:
+      self.printUsageErr("No record/play operator specified.")
+      sys.exit(APP_EC_ARGS)
+    elif args[0] not in ('record', 'play'):
+      self.printUsageErr("%s: Invalid record/play operator.")
+      sys.exit(APP_EC_ARGS)
+    else:
+      kwargs['op'] = args[0]
+    if len(args) < 2:
+      self.printUsageErr("No FILE specified.")
+      sys.exit(APP_EC_ARGS)
+    else:
+      kwargs['filename'] = args[1]
+
+    if len(kwargs['name']) == 0:
+      kwargs['name'] = os.path.basename(kwargs['filename'])
+
+    return kwargs
+
+  #
+  ## \brief Block waiting for any keyboard key press.
+  ##
+  ## \param timeout   Keyboard event timeout in seconds.
+  ##
+  ## \return Return pressed keyboard code. If timed out, return 0.
+  #
+  def kbhit(self, timeout=0.0):
+    fd = sys.stdin.fileno()
+    oldattr = termios.tcgetattr(fd)
+    newattr = termios.tcgetattr(fd)
+    newattr[3] = newattr[3] & ~termios.ICANON & ~termios.ECHO
+    termios.tcsetattr(fd, termios.TCSANOW, newattr)
+    oldflags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, oldflags | os.O_NONBLOCK)
+    t  = 0.0
+    dt = 0.05
+    try:
+      while timeout == 0.0 or t <= timeout:
+        try:
+          c = sys.stdin.read(1)
+          #print 'here', repr(c)
+          break
+        except IOError:
+          pass
+        time.sleep(dt)
+        t += dt
+    finally:
+      termios.tcsetattr(fd, termios.TCSAFLUSH, oldattr)
+      fcntl.fcntl(fd, fcntl.F_SETFL, oldflags)
+    if timeout > 0.0 and t > timeout:
+      return 0
+    else:
+      return c
+
+  #
+  ## \brief Print text to stdout and flush.
+  ##    
+  ## Output file stream stdout is usually line buffered. To force display
+  ## of text with no newlines, flush after writing.
+  ##
+  ## \param text  Text string to print.
+  #
+  def pr(self, text):
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+  #
+  ## \brief Prompt user for keyboard input.
+  ##
+  ## \param erase     Do [not] erase prompt on keyboard event.
+  ## \param timeout   Keyboard event timeout in seconds.
+  ##
+  ## \return Return pressed keyboard code. If timed out, return 0.
+  #
+  def prompt(self, pstr, erase=False, timeout=0.0):
+    self.pr(pstr)
+    c = self.kbhit(timeout)
+    if erase:
+      self.pr("\r%*s\r" % (len(pstr), "")) # erase prompt
+    return c
+
+  #
+  ## \brief Show ascii progress bar.
+  ##    
+  ## \param index Progress index.
+  #
+  def show_progress_bar(self, index):
+    self.pr("%s\r" % (ProgressChars[index]))
+
+  #
+  ## \brief Update robot status callback.
+  ##
+  ## This callback on receipt of a hekateros_control published state message.
+  ##
+  ## \param robotStatus   Robot status extended message.
+  #
+  def updateRobotStatus(self, robotStatus):
+    if robotStatus.in_motion.val == TriState.ON:
+      self.m_robotIsMoving = True
+    else:
+      self.m_robotIsMoving = False
+
+  #
+  ## \brief Update joint state callback.
+  ##
+  ## This callback on receipt of a hekateros_control published state message.
+  ##
+  ## \param jointState  Joint state extended message.
+  #
+  def updateJointStates(self, jointState):
+    # no joints
+    if len(jointState.name) == 0:
+      return
+    self.m_jointNames       = jointState.name
+    self.m_jointPositions   = jointState.position
+    self.m_jointVelocities  = jointState.velocity
+
+  #
+  ## \brief Write recording comment block heading to stream.
+  ##
+  ## \param stream    Opend (file) stream.
+  #
+  def writeRecordingHeader(self, stream):
+    stream.write("#\n")
+    stream.write("# Hekateros Movement Recording\n")
+    stream.write("#\n")
+    stream.write("# %s\n" % (self.kwargs['name']))
+    stream.write("#\n")
+    stream.write("# File: %s\n" % (os.path.basename(self.kwargs['filename'])))
+    stream.write("# Date: %s\n" % (time.asctime(time.localtime())))
+    stream.write("#\n")
+
+  #
+  ## \brief Record current Hekateros position.
+  ##
+  ## The yaml document is updated.
+  #
+  def recordPosition(self):
+    move = {}
+    move['tag'] = "Move %d: " % (len(self.m_doc['moves'])+1)
+    move['joint_names'] = self.m_jointNames
+    move['positions']   = []
+    for pos in self.m_jointPositions:
+      move['positions'].append(radToDeg(pos))
+    vel = self.kwargs['velocity']
+    move['velocities']  = [vel] * len(self.m_jointNames)
+    move['pause']       = self.kwargs['time']
+    self.m_doc['moves'].append(move)
+
+  #
+  ## \brief Record a series of Hekateros moves and save to yaml file.
+  ##
+  ## \return Returns APP_EC_OK(0) on success, non-zero value on failure.
+  #
+  def record(self):
+    try:
+      stream = open(self.kwargs['filename'], 'w')
+    except IOError, e:
+      print "%s:" % (self._Argv0), e
+      return APP_EC_EXEC
+
+    self.m_doc = {}
+    self.m_doc['name']  = self.kwargs['name']
+    self.m_doc['moves'] = []
+
+    quit = False
+
+    print
+    print "Hekateros Movement Recording"
+    print "Name:    ", self.kwargs['name']
+    print "File:    ", self.kwargs['filename']
+    print "Controls:"
+    print self.helpRecordControls()
+    print ""
+
+    n = 1
+
+    while not quit:
+      c = self.prompt("Record mark: ", True)
+      if c == 'q' or c == '\x1b':
+        quit = True
+        break
+      elif c == 'h':
+        print self.helpRecordControls()
+      elif c == 'r' or c == ' ':
+        print "Recording position as move %d." % (n)
+        self.recordPosition()
+        n += 1
+      else:
+        print repr(c), "?"
+
+    if len(self.m_doc['moves']) > 0:
+      self.writeRecordingHeader(stream)
+      yaml.dump(self.m_doc, stream, default_flow_style=False)
+      print "%d moves recorded." % (len(self.m_doc['moves']))
+    else:
+      print "Nothing to record."
+    stream.close()
+
+    return APP_EC_OK
+
+  #
+  ## \brief Load moves or trajectories from file.
+  ##
+  ## The file is opened, parsed, and loaded into a structured document.
+  ##    
+  ## \param filename  Name of file specifying trajectory.
+  ##
+  ## \return True on success, False on failure.
+  #
+  def loadMoves(self, filename):
+    try:
+      stream = open(filename, 'r')
+    except IOError, e:
+      print "%s:" % (self._Argv0), e
+      return False
+    try:
+      self.m_doc = yaml.load(stream)
+    except yaml.scanner.ScannerError, e:
+      print "%s: YAML:" % (self._Argv0), e
+      return False
+    finally:
+      stream.close()
+    if not self.m_doc.has_key('name'):
+      self.m_doc['name'] = self.kwarg['name']
+    return True
+
+  #
+  ## \brief Make a ROS goal trajectory message from the loaded document move.
+  #
+  def makeMoveMsg(self, move):
+    jointTrajectory = trajectory_msgs.msg.JointTrajectory()
+    jointTrajectory.joint_names = move['joint_names']
+    jtp = trajectory_msgs.msg.JointTrajectoryPoint()
+    jtp.positions = []
+    for pos in move['positions']:
+      jtp.positions.append(degToRad(pos))
+    jtp.velocities = []
+    for vel in move['velocities']:
+      jtp.velocities.append(degToRad(vel)*self.kwargs['xplay'])
+    jtp.accelerations = [0.0] * len(move['joint_names'])
+    jointTrajectory.points.append(jtp)
+    return jointTrajectory
+
+  #
+  ## \brief Execute Hekateros trajectory.
+  ##    
+  ## The execution is performed by publishing the trajectory to
+  ## Hekateros (hekateros_control) node.
+  ##
+  ## \return True on success, False on failure.
+  #
+  def execMove(self, trajectory):
+    msg = "  Executing move ..."
+    self.pr(msg+"\r")
+
+    try:
+      self.m_joint_cmd_pub.publish(trajectory)
+    except rospy.ROSException, e:
+      print msg, "failed."
+      return False
+
+    i         = 0
+    noMoveCnt = 0
+
+    #
+    # Track progress.
+    #
+    while True:
+      self.show_progress_bar(i)
+      i = (i+1) % len(ProgressChars)
+      if self.m_robotIsMoving:
+        noMoveCnt = 0
+      else:
+        noMoveCnt += 1
+      if noMoveCnt >= 3:
+        print msg, "done."
+        return True
+      time.sleep(0.1)
+
+  #
+  ## \brief Play back recorded Hekateros movement from file.
+  ##
+  ## \todo TODO Add support to parse captured trajectories from:
+  ## 'rostopic echo /hekateros_control/joint_command'
+  ##
+  ## \return Returns APP_EC_OK(0) on success, non-zero value on failure.
+  #
+  def play(self):
+    if not self.loadMoves(self.kwargs['filename']):
+      return APP_EC_EXEC
+
+    quit = False
+
+    print
+    print "Hekateros Movement Playback"
+    print "Name:    ", self.m_doc['name']
+    print "File:    ", self.kwargs['filename']
+    print "Controls:"
+    print self.helpPlayControls()
+    print ""
+
+    cycle = 1
+
+    #
+    # Cycle through list of moves.
+    #
+    while not quit and (self.kwargs['loop'] or cycle == 1):
+      if self.kwargs['loop']:
+        print "\n\n  * Cycle %d *" % (cycle)
+
+      n = 1
+
+      #
+      # Loop through all moves in list.
+      #
+      for move in self.m_doc['moves']:
+        doMove = False
+        tag = move.get('tag', "Move %d:" % (n))
+        print tag
+        trajectory = self.makeMoveMsg(move)
+        t = move.get('pause', self.kwargs['time'])
+        if self.kwargs['auto']:
+          c = self.prompt("  in %.2f seconds." % (t), True, t)
+        else:
+          c = self.prompt("  Press Play... ", True)
+
+        if c == 'q' or c == '\x1b':
+          print "  Quit"
+          quit = True
+          break
+        elif c == 'h':
+          print self.helpPlayControls()
+        elif c == 'p' or c == ' ' or c == 0:
+          doMove = True
+        else:
+          print repr(c), "?"
+
+        if doMove:
+          if not self.execMove(trajectory):
+            return APP_EC_EXEC
+          n += 1
+
+      cycle += 1
+
+    return APP_EC_OK
+
+
+  #
+  ## \brief Run application.
+  ##    
+  ## \param argv    Optional argument list to override command-line arguments.
+  ## \param kwargs  Optional keyword argument list.
+  ##
+  ## \return Exit code.
+  #
+  def run(self, argv=None, **kwargs):
+  
+    # parse command-line options and arguments
+    try:
+      self.kwargs = self.getOptions(argv, **kwargs)
+    except usage, e:
+      self.printUsageErr(e.msg)
+      return APP_EC_ARGS
+
+    self.m_robotIsMoving    = False
+    self.m_jointNames       = []
+    self.m_jointPositions   = []
+    self.m_jointVelocities  = []
+
+    try:
+      # initialize ROS node
+      rospy.init_node('move_arm')
+
+      # subscribe to extended robot status data
+      rospy.Subscriber("hekateros_control/robot_status_ex", 
+                      HekRobotStatusExtended, 
+                      self.updateRobotStatus) 
+
+      # subscribe to extended joint state data
+      rospy.Subscriber("hekateros_control/joint_states_ex", 
+                        HekJointStateExtended, 
+                        self.updateJointStates) 
+
+      # publish trajectory to hekateros controller
+      self.m_joint_cmd_pub = rospy.Publisher(
+          "hekateros_control/joint_command",
+          trajectory_msgs.msg.JointTrajectory)
+
+      print "Hekateros interface initialized."
+    except rospy.ROSInitException, e:
+      print "%s:" % (self._Argv0), e
+      return APP_EC_EXEC
+    except rospy.ROSInterruptException, e:
+      print "%s:" % (self._Argv0), e
+      return APP_EC_EXEC
+
+    if self.kwargs['op'] == 'record':
+      return self.record()
+    elif self.kwargs['op'] == 'play':
+      return self.play()
+    else:
+      print "BUG: %s: unknown operator."
+      return APP_EC_ARGS
+
+
+
+# ------------------------------------------------------------------------------
+# main
+# ------------------------------------------------------------------------------
+if __name__ == '__main__':
+  app = application();
+  sys.exit( app.run() );

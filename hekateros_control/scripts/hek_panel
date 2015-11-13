@@ -1,0 +1,2217 @@
+#! /usr/bin/env python
+
+###############################################################################
+#
+# Package:  RoadNarrows Robotics Hekateros Robotic Manipulator Package
+#
+# Link:     https://github.com/roadnarrows-robotics/hekateros
+#
+# ROS Node: hek_panel
+#
+# File: hek_panel
+#
+## \file 
+##
+## $LastChangedDate$
+## $Rev$
+##
+## \brief Graphical panel to interface with the hekateros_control node.
+##
+## \author Daniel Packard (daniel@roadnarrows.com)
+## \author Robin Knight (robin.knight@roadnarrows.com)
+##  
+## \par Copyright:
+##   (C) 2013-2015.  RoadNarrows LLC.\n
+##   (http://www.roadnarrows.com)\n
+##   All Rights Reserved
+##
+# @EulaBegin@
+# @EulaEnd@
+#
+###############################################################################
+
+import sys
+import os
+import time
+import math
+import getopt
+
+from Tkinter import *
+from Tkconstants import *
+from tkFileDialog import *
+import tkFont
+
+import webbrowser
+
+import roslib; roslib.load_manifest('hekateros_control')
+import rospy
+
+import actionlib
+from actionlib_msgs.msg import GoalStatus
+import trajectory_msgs.msg
+
+from industrial_msgs.msg import RobotMode
+from industrial_msgs.msg import TriState
+
+from hekateros_control.msg import HekRobotStatusExtended
+from hekateros_control.msg import HekJointStateExtended
+from hekateros_control.msg import ServoHealth
+from hekateros_control.msg import HekOpState
+from hekateros_control.msg import ProductInfo
+from hekateros_control.srv import GotoParkedPos
+from hekateros_control.srv import GotoBalancedPos
+from hekateros_control.srv import GotoZeroPt
+from hekateros_control.srv import OpenGripper
+from hekateros_control.srv import CloseGripper
+from hekateros_control.srv import EStop
+from hekateros_control.srv import ResetEStop
+from hekateros_control.srv import Freeze
+from hekateros_control.srv import Release
+from hekateros_control.srv import ClearAlarms
+from hekateros_control.srv import GetProductInfo
+
+from hekateros_control.Utils import *
+from hekateros_control.AboutDlg import AboutDlg
+from hekateros_control.WarnDlg import WarnDlg
+from hekateros_control.MoveDlg import MoveDlg
+from hekateros_control.PasswordDlg import PasswordDlg
+from hekateros_control.ROSInfoDlg import ROSInfoDlg
+from hekateros_control.PanelConfig import *
+from hekateros_control.XboxConfig import *
+from hekateros_control.EECam import *
+from hekateros_control.ACCalibrate import *
+
+
+# ------------------------------------------------------------------------------
+# Globals
+# ------------------------------------------------------------------------------
+
+## \brief Application version. Update as needed. 
+appVersion = '1.4.0'
+
+## \brief Hekateros wiki URL
+hekWikiUrl = "https://github.com/roadnarrows-robotics/hekateros/wiki"
+
+## \brief Image search paths.
+imagePath = [
+  "/prj/share/appkit/images",
+  "/usr/local/share/appkit/images"
+]
+
+## \brief Alarm strings.
+alarmStrings = {
+  ServoHealth.ALARM_NONE:         "ok",
+  ServoHealth.ALARM_VOLTAGE:      "V",
+  ServoHealth.ALARM_ANGLE:        "pos",
+  ServoHealth.ALARM_TEMP:         "T",
+  ServoHealth.ALARM_CMD_RANGE:    "",
+  ServoHealth.ALARM_CHECKSUM:     "",
+  ServoHealth.ALARM_LOAD:         "load",
+  ServoHealth.ALARM_INSTRUCTION:  ""
+}
+
+## \brief Common foreground colors.
+fgColors = {
+  'normal':   'black',
+  'ok':       '#008800',
+  'focus':    '#0000aa',
+  'warning':  '#aa6600',
+  'error':    '#cc0000'
+}
+
+## \brief no servo id
+DYNA_ID_NONE = 255
+
+
+# ------------------------------------------------------------------------------
+# Class window
+# ------------------------------------------------------------------------------
+
+##
+## \brief Window class supporting application.
+##
+class window(Frame):
+  #
+  ## \brief Constructor.
+  ##
+  ## \param master  Window parent master widget.
+  ## \param cnf     Configuration dictionary.
+  ## \param kw      Keyword options.
+  #
+  def __init__(self, master=None, cnf={}, **kw):
+    self.m_wMaster = master
+
+    # intialize window data
+    kw = self.initData(kw)
+
+    # initialize parent object frame
+    Frame.__init__(self, master=master, cnf=cnf, **kw)
+
+    # window title
+    self.master.title("Hekateros Control Panel")
+
+    self.m_imageLoader = ImageLoader(py_pkg='hekateros_control.images',
+                                      image_paths=imagePath)
+
+    self.m_icons['app_icon'] = self.m_imageLoader.load("icons/HekPanelIcon.png")
+    self.master.tk.call('wm', 'iconphoto', self.master._w,
+        self.m_icons['app_icon'])
+
+    # create and show widgets
+    self.createWidgets()
+    self.grid(row=0, column=0, padx=5, pady=5)
+
+  #
+  ## \brief Initialize class state data.
+  ##
+  ## Any keywords for this application specific window that are not supported 
+  ## by the Frame Tkinter class must be removed.
+  ##
+  ## \param kw      Keyword options.
+  ##
+  ## \return Modified keywords sans this specific class.
+  #
+  def initData(self, kw):
+    self.m_hekName        = "hekateros"
+    self.m_bHasJointPanel = False # joint state panel [not] created 
+                                  # application configuration
+    self.m_cfgPanel       = PanelConfigDlg.ConfigDft.copy() # panel config
+    self.m_cfgEECam       = EECamConfigDlg.ConfigDft.copy() # ee camera config
+    self.m_icons          = {}    # must keep loaded icons referenced
+    self.m_wBttn          = {}    # button widgets
+    self.m_keysFewMoves   = []    # gui button keys depending on calibration
+    self.m_keysNoMoves    = []    # gui button keys depending on robot mode
+    self.m_robotStatus    = {}    # robot status widgets, variables, and values
+    self.m_robotJoint     = {}    # robot joint state widgets, variables, etc.
+    self.m_robotServo     = {}    # servo id to joint name map
+
+    # calibration state
+    self.m_calibState = {
+      'calibrating':  False,    # [not] calibrating
+      'ac':           None,     # calibration action client
+      'id':           0         # after id
+    }
+
+    # joint field table column ordering of field keys
+    self.m_jointFieldOrd = [
+        'joint', 'servo_id', 'state', 'position', 'odometer', 'encoder',
+        'velocity', 'speed', 'effort', 'temperature', 'voltage', 'alarms'
+    ]
+
+    # joint field table format info by field key
+    self.m_jointFieldFmt = {
+        'joint':
+          {'hdr0': '',          'hdr1': 'Joint',      'width': 12,  'align': W},
+        'servo_id':
+          {'hdr0': '',          'hdr1': 'Servo Id',   'width': 8,   'align': E},
+        'state':
+          {'hdr0': '',          'hdr1': 'State',      'width': 12,  'align': W},
+        'position':
+          {'hdr0': 'Position',  'hdr1': '(degrees)',  'width': 12,  'align': E},
+        'odometer':
+          {'hdr0': 'Odometer',  'hdr1': '(ticks)   ', 'width': 12,  'align': E},
+        'encoder':
+          {'hdr0': 'Encoder',   'hdr1': '(ticks)  ',  'width': 12,  'align': E},
+        'velocity':
+          {'hdr0': 'Velocity',  'hdr1': '(deg/sec)',   'width': 10,  'align': E},
+        'speed':
+          {'hdr0': 'Speed',     'hdr1': '(raw) ',     'width': 6,   'align': E},
+        'effort':
+          {'hdr0': 'Effort',    'hdr1': '(raw) ',     'width': 6,   'align': E},
+        'temperature':
+          {'hdr0': 'Temp',      'hdr1': '(C)  ',      'width': 7,   'align': E},
+        'voltage':
+          {'hdr0': 'Voltage',   'hdr1': '(V)    ',    'width': 7,   'align': E},
+        'alarms':
+          {'hdr0': '',          'hdr1': 'Alarms',     'width': 15,  'align': W}
+    }
+
+    # override panel configuration
+    if kw.has_key('config'):
+      self.m_cfgPanel = kw['config'].copy()
+      del kw['config']
+    # or read configuration
+    else:
+      self.readPanelConfig()
+
+    # publish move callback
+    if kw.has_key('pub_joint_move_cb'):
+      self.cbMoveRobot = kw['pub_joint_move_cb']
+      del kw['pub_joint_move_cb']
+
+    # read end effector camera configuration
+    self.readEECamConfig()
+
+    return kw
+
+  #
+  ## \brief Create gui widgets with supporting data and show.
+  #
+  def createWidgets(self):
+    self.createMenu()
+    self.createHeading()
+    self.createLeftButtons()
+    self.createCenterPanel()
+    self.createRightButtons()
+    self.createStatusBar()
+    self.updateButtonState(self.m_keysFewMoves, 'disabled')
+
+  #
+  ## \brief Create menu
+  #
+  def createMenu(self):
+    # top menu bar
+    self.m_wMenuBar = Menu(self)
+
+    # file menu
+    self.m_wMenuFile = Menu(self.m_wMenuBar, tearoff=0)
+    self.m_wMenuFile.add_command(label="Recording...", command=self.notimpl)
+    self.m_wMenuFile.add_separator()
+    self.m_wMenuFile.add_command(label="Quit", command=self.destroy)
+    self.m_wMenuBar.add_cascade(label="File", menu=self.m_wMenuFile)
+
+    # settings menu
+    self.m_wMenuSettings = Menu(self.m_wMenuBar, tearoff=0)
+    self.m_wMenuSettings.add_command(label="Control Panel...",
+        command=self.settingsPanel)
+    self.m_wMenuSettings.add_command(label="End Effector Camera...",
+        command=self.settingsEECam)
+    self.m_wMenuSettings.add_command(label="Xbox Teleoperation...",
+        command=self.settingsXbox)
+    self.m_wMenuBar.add_cascade(label="Settings", menu=self.m_wMenuSettings)
+
+    # calibrate menu
+    self.m_wMenuBar.add_command(label="Calibrate", command=self.calibrate)
+
+    # move menu
+    self.m_wMenuMove = Menu(self.m_wMenuBar, tearoff=0)
+    self.m_wMenuMove.add_command(label="Park", command=self.gotoParkedPos)
+    self.m_wMenuMove.add_command(label="Balance", command=self.gotoBalancedPos)
+    self.m_wMenuMove.add_command(label="Zero Point", command=self.gotoZeroPt)
+    self.m_wMenuMove.add_command(label="Open Gripper", command=self.openGripper)
+    self.m_wMenuMove.add_command(label="Close Gripper",
+        command=self.closeGripper)
+    self.m_wMenuMove.add_separator()
+    self.m_wMenuMove.add_command(label="Specify Move...",
+        command=self.specifyMove)
+    self.m_wMenuMove.add_separator()
+    self.m_wMenuMove.add_command(label="Freeze", command=self.freezeArm)
+    self.m_wMenuMove.add_command(label="Release", command=self.releaseArm)
+                          #image=self.m_icons['release'])
+    self.m_wMenuMove.add_separator()
+    self.m_wMenuMove.add_command(label="EStop", command=self.estop)
+    self.m_wMenuBar.add_cascade(label="Move", menu=self.m_wMenuMove)
+
+    # camera menu
+    self.m_wMenuCam = Menu(self.m_wMenuBar, tearoff=0)
+    self.m_wMenuCam.add_command(label="Start EE Camera...",
+        command=self.startEECam)
+    self.m_wMenuCam.add_command(label="Stop EE Camera...",
+        command=self.stopEECam)
+    self.m_wMenuBar.add_cascade(label="Camera", menu=self.m_wMenuCam)
+
+    # applications menu
+    self.m_wMenuApps = Menu(self.m_wMenuBar, tearoff=0)
+    self.m_wMenuApps.add_command(label="Record...", command=self.notimpl)
+    self.m_wMenuApps.add_command(label="Graph Joints", command=self.notimpl)
+    self.m_wMenuBar.add_cascade(label="Apps", menu=self.m_wMenuApps)
+
+    # help menu
+    self.m_wMenuHelp = Menu(self.m_wMenuBar, tearoff=0)
+    self.m_wMenuHelp.add_command(label="Online Hekateros Wiki",
+        command=lambda aurl=hekWikiUrl:webbrowser.open_new(hekWikiUrl))
+    self.m_wMenuHelp.add_separator()
+    self.m_wMenuHelp.add_command(label="ROS Info...", command=self.ROSInfo)
+    self.m_wMenuHelp.add_command(label="About...", command=self.about)
+    self.m_wMenuBar.add_cascade(label="Help", menu=self.m_wMenuHelp)
+
+    self.m_wMaster.config(menu=self.m_wMenuBar)
+
+  #
+  ## \brief Create top gui heading.
+  #
+  def createHeading(self):
+    # rn logo
+    w = Label(self)
+    self.m_icons['rn_logo'] = self.m_imageLoader.load("RNLogo48.png");
+    if self.m_icons['rn_logo']:
+      w['image'] = self.m_icons['rn_logo']
+    else:
+      w['text'] = 'rn'
+      w['anchor'] = W
+      w['width'] = 5
+    w.grid(row=0, column=0, sticky=W)
+    
+    # top heading
+    w = Label(self)
+    w['font']   = ('Helvetica', 16)
+    w['text']   = "Hekateros Control Panel"
+    w['anchor'] = CENTER
+    w.grid(row=0, column=1, sticky=E+W)
+    self.m_wTopHeading = w
+
+    # hek logo
+    w = Label(self)
+    self.m_icons['hek_logo'] = \
+        self.m_imageLoader.load("icons/icon_hek_logo.png");
+    if self.m_icons['hek_logo']:
+      w['image'] = self.m_icons['hek_logo']
+      w['anchor'] = E
+    else:
+      w['text'] = 'hek'
+      w['anchor'] = E
+      w['width'] = 5
+    w.grid(row=0, column=2, sticky=E)
+    
+  #
+  ## \brief Create gui left hand side buttons.
+  #
+  def createLeftButtons(self):
+    wframe = Frame(self)
+    wframe['borderwidth'] = 2
+    wframe['relief'] = 'ridge'
+    wframe.grid(row=1, column=0, padx=1, pady=3, sticky=N+W+E)
+
+    row = 0
+
+    # calibrate
+    w = self.createButton(wframe, "Calibrate", "icons/icon_calib.png",
+                            self.calibrate)
+    w.grid(row=row, column=0, sticky=N+E+W)
+    self.m_icons['calibrate_cancel'] = \
+        self.m_imageLoader.load("icons/icon_calib_cancel.png")
+    self.m_keysNoMoves.append('calibrate')
+
+    # park
+    row += 1
+    w = self.createButton(wframe, "Park", "icons/icon_hek_park.png",
+                            self.gotoParkedPos)
+    w.grid(row=row, column=0, sticky=N+E+W)
+    self.m_keysFewMoves.append('park')
+    self.m_keysNoMoves.append('park')
+
+    # balance
+    row += 1
+    w = self.createButton(wframe, "Balance", "icons/icon_hek_balance.png",
+                            self.gotoBalancedPos)
+    w.grid(row=row, column=0, sticky=N+E+W)
+    self.m_keysFewMoves.append('balance')
+    self.m_keysNoMoves.append('balance')
+
+    # zero point
+    row += 1
+    w = self.createButton(wframe, "Zero\nPoint", "icons/icon_hek_zeropt.png",
+                            self.gotoZeroPt)
+    w.grid(row=row, column=0, sticky=N+E+W)
+    self.m_keysFewMoves.append('zero_point')
+    self.m_keysNoMoves.append('zero_point')
+
+    # open gripper
+    row += 1
+    w = self.createButton(wframe, "Open\nGripper",
+                                  "icons/icon_gripper_open.png",
+                                  self.openGripper)
+    w.grid(row=row, column=0, sticky=N+E+W)
+    self.m_keysFewMoves.append('open_gripper')
+    self.m_keysNoMoves.append('open_gripper')
+
+    # close gripper
+    row += 1
+    w = self.createButton(wframe, "Close\nGripper",
+                                  "icons/icon_gripper_close.png",
+                                  self.closeGripper)
+    w.grid(row=row, column=0, sticky=N+E+W)
+    self.m_keysFewMoves.append('close_gripper')
+    self.m_keysNoMoves.append('close_gripper')
+
+    # specify move
+    row += 1
+    w = self.createButton(wframe, "Specify\nMove",
+                                  "icons/icon_hek_in_motion.png",
+                                  self.specifyMove)
+    w.grid(row=row, column=0, sticky=N+E+W)
+    self.m_keysFewMoves.append('specify_move')
+    self.m_keysNoMoves.append('specify_move')
+
+  #
+  ## \brief Create robot status and joint state center panel.
+  #
+  def createCenterPanel(self):
+    self.m_wPanelFrame = Frame(self)
+    self.m_wPanelFrame['borderwidth'] = 2
+    self.m_wPanelFrame['relief'] = 'ridge'
+    self.m_wPanelFrame.grid(row=1, column=1, padx=1, pady=3, sticky=N+W+E)
+
+    self.createRobotStatusPanel(self.m_wPanelFrame, 0)
+    self.createJointStatePanelHdr(self.m_wPanelFrame, 1)
+
+  #
+  ## \brief Create robot status upper center panel.
+  ##
+  ## \param parent  Parent widget.
+  ## \param row     Row in parent widget.
+  #
+  def createRobotStatusPanel(self, parent, row):
+    wframe = LabelFrame(parent, text='Robot Status')
+    wframe['font'] =('Helvetica', 12)
+    wframe['fg'] = fgColors['focus']
+    wframe['borderwidth'] = 2
+    wframe['relief'] = 'ridge'
+    wframe.grid(row=row, column=0, padx=1, pady=3, sticky=N+W+E)
+
+    width = 12
+    row   = 0
+    col   = 0
+
+    # robot mode field label
+    w = Label(wframe)
+    w['text']     = 'Mode: '
+    w['justify']  = RIGHT
+    w['anchor']   = W
+    w['relief']   = 'flat'
+    w.grid(row=row, column=col, sticky=W)
+
+    col += 1
+
+    # robot mode field
+    var = StringVar()
+    text, color = self.toRobotMode(RobotMode.AUTO)
+    var.set(text)
+    w = Entry(wframe)
+    w['borderwidth'] = 2
+    w['relief']   = 'flat'
+    w['width']    = width
+    w['textvar']  = var
+    w['fg']       = color
+    w['state']    = 'readonly'
+    w.grid(row=row, column=col, padx=0, pady=0, sticky=W)
+    d = {'raw': RobotMode.AUTO, 'var': var, 'w': w}
+    self.m_robotStatus['mode'] = d
+
+    col += 1
+
+    # state field label
+    w = Label(wframe)
+    w['text']     = 'State: '
+    w['justify']  = RIGHT
+    w['anchor']   = W
+    w['relief']   = 'flat'
+    w.grid(row=row, column=col, sticky=W)
+
+    col += 1
+
+    # robot state field
+    var = StringVar()
+    text, color = self.toCalib(TriState.FALSE)
+    var.set(text)
+    w = Entry(wframe)
+    w['borderwidth'] = 2
+    w['relief']   = 'flat'
+    w['width']    = width
+    w['textvar']  = var
+    w['fg']       = color
+    w['state']    = 'readonly'
+    w.grid(row=row, column=col, padx=0, pady=0, sticky=W)
+    d = {'raw': TriState.FALSE, 'var': var, 'w': w}
+    self.m_robotStatus['calibration'] = d
+
+    col += 1
+
+    spacer = Label(wframe, text=' ', width=24)
+    spacer.grid(row=row, column=col, padx=0, pady=0, sticky=W+E)
+
+    col += 1
+
+    wframe = Frame(wframe)
+    wframe['borderwidth'] = 0
+    wframe['relief'] = 'flat'
+    wframe.grid(row=row, column=col, padx=1, pady=3, sticky=N+E)
+
+    self.m_icons['led_dark']  = \
+        self.m_imageLoader.load("icons/icon_led_dark_16.png")
+    self.m_icons['led_green'] = \
+        self.m_imageLoader.load("icons/icon_led_green_16.png")
+    self.m_icons['led_red']   = \
+        self.m_imageLoader.load("icons/icon_led_red_16.png")
+
+    row = 0
+    col = 0
+
+    # motors powered status
+    w = Label(wframe)
+    w['text']     = 'Motors'
+    w['width']    = width
+    w['justify']  = RIGHT
+    w['anchor']   = E
+    w['relief']   = 'flat'
+    w.grid(row=row, column=col, sticky=E+W)
+    d = {'raw': None, 'var': None, 'w': w}
+    self.m_robotStatus['motors_label'] = d
+
+    col += 1
+
+    # motors icon
+    w = Label(wframe)
+    w['image'] = self.m_icons['led_dark']
+    w['justify'] = LEFT
+    w.grid(row=row, column=col, sticky=W+E)
+    d = {'raw': TriState.OFF, 'var': None, 'w': w}
+    self.m_robotStatus['motors_led'] = d
+
+    col += 1
+
+    # moving status
+    w = Label(wframe)
+    w['text']     = 'Moving'
+    w['width']    = width
+    w['justify']  = RIGHT
+    w['anchor']   = E
+    w['relief']   = 'flat'
+    w.grid(row=row, column=col, sticky=E+W)
+    d = {'raw': None, 'var': None, 'w': w}
+    self.m_robotStatus['moving_label'] = d
+
+    col += 1
+
+    # moving icon
+    w = Label(wframe)
+    w['image'] = self.m_icons['led_dark']
+    w['justify'] = LEFT
+    w.grid(row=row, column=col, sticky=W+E)
+    d = {'raw': TriState.OFF, 'var': None, 'w': w}
+    self.m_robotStatus['moving_led'] = d
+
+    col += 1
+
+    # robot alarms status
+    w = Label(wframe)
+    w['text']     = 'Alarms'
+    w['width']    = width
+    w['justify']  = RIGHT
+    w['anchor']   = E
+    w['relief']   = 'flat'
+    w.grid(row=row, column=col, sticky=E+W)
+    d = {'raw': None, 'var': None, 'w': w}
+    self.m_robotStatus['alarms_label'] = d
+
+    col += 1
+
+    # alarms icon
+    w = Label(wframe)
+    w['image'] = self.m_icons['led_dark']
+    w['justify'] = LEFT
+    w.grid(row=row, column=col, sticky=W+E)
+    d = {'raw': TriState.OFF, 'var': None, 'w': w}
+    self.m_robotStatus['alarms_led'] = d
+
+    col += 1
+
+    # robot estop status
+    w = Label(wframe)
+    w['text']     = 'EStop'
+    w['width']    = width
+    w['justify']  = RIGHT
+    w['anchor']   = E
+    w['relief']   = 'flat'
+    w.grid(row=row, column=col, sticky=E)
+    d = {'raw': None, 'var': None, 'w': w}
+    self.m_robotStatus['estop_label'] = d
+
+    col += 1
+
+    # estop icon
+    w = Label(wframe)
+    w['image'] = self.m_icons['led_dark']
+    w['justify'] = LEFT
+    w.grid(row=row, column=col, sticky=E)
+    d = {'raw': TriState.OFF, 'var': None, 'w': w}
+    self.m_robotStatus['estop_led'] = d
+
+  #
+  ## \brief Create joint state lower center panel headers.
+  ##
+  ## \param parent  Parent widget.
+  ## \param row     Row in parent widget.
+  #
+  def createJointStatePanelHdr(self, parent, row):
+    wframe = LabelFrame(parent, text='Joint State')
+    wframe['font'] =('Helvetica', 12)
+    wframe['fg'] = fgColors['focus']
+    wframe['borderwidth'] = 2
+    wframe['relief'] = 'ridge'
+    wframe.grid(row=row, column=0, padx=1, pady=3, sticky=N+W+E)
+    self.m_wJointStateFrame = wframe
+
+    helv  = tkFont.Font(family="Helvetica",size=10,weight="bold")
+    padx  = 2
+    pady  = 0
+    row   = 0
+    col   = 0
+
+    # rows of labels
+    for key in self.m_jointFieldOrd:
+      fmt = self.m_jointFieldFmt[key]
+      w = Label(wframe, padx=padx, pady=pady, font=helv,
+                text=fmt['hdr0'], width=fmt['width'], anchor=fmt['align'])
+      w.grid(row=row, column=col, sticky=fmt['align'])
+      w = Label(wframe, padx=padx, pady=pady, font=helv,
+                text=fmt['hdr1'], width=fmt['width'], anchor=fmt['align'])
+      w.grid(row=row+1, column=col, sticky=fmt['align'])
+      col += 1
+
+  #
+  ## \brief Create joint state lower center panel state.
+  ##
+  ## \param joint   Joint state
+  #
+  def createJointStatePanel(self, joint):
+    wframe = self.m_wJointStateFrame
+
+    bgList  = ['#cccccc', '#dddddd']    # row background color list
+    row     = 2                         # starting row number
+    padx    = 0                         # x padding
+    pady    = 0                         # y padding
+
+    for i in range(0, len(joint.name)):
+      name = joint.name[i]
+      self.m_robotJoint[name] = {}
+
+      bg = bgList[i%len(bgList)]
+
+      # joint
+      key = 'joint'
+      fmt = self.m_jointFieldFmt[key]
+      col = self.m_jointFieldOrd.index(key)
+      w = Label(wframe, bg=bg,
+                  anchor=fmt['align'], width=fmt['width'], text=name)
+      w.grid(row=row, column=col, sticky=fmt['align'])
+
+      #
+      # Master servo
+      #
+      servoId = ord(joint.master_servo_id[i])
+
+      # servo id
+      key     = 'servo_id'
+      fmt     = self.m_jointFieldFmt[key]
+      col     = self.m_jointFieldOrd.index(key)
+      justify = self.alignToJustify(fmt['align'])
+      var     = IntVar()
+      var.set(servoId)
+      w = Entry(wframe, relief='flat', justify=justify, textvar=var,
+                        fg=fgColors['normal'],  bg=bg, readonlybackground=bg,
+                        width=fmt['width'], state='readonly')
+      w.grid(row=row, column=col, padx=padx, pady=pady, sticky=fmt['align'])
+      self.m_robotJoint[name][key] = {'raw': servoId, 'var': var, 'w': w}
+      self.m_robotServo[servoId] = name
+    
+      # joint state
+      key     = 'state'
+      fmt     = self.m_jointFieldFmt[key]
+      col     = self.m_jointFieldOrd.index(key)
+      justify = self.alignToJustify(fmt['align'])
+      var     = StringVar()
+      w = Entry(wframe, relief='flat', justify=justify, textvar=var,
+                        fg=fgColors['normal'], bg=bg, readonlybackground=bg,
+                        width=fmt['width'], state='readonly')
+      w.grid(row=row, column=col, padx=padx, pady=pady, sticky=fmt['align'])
+      self.m_robotJoint[name][key] = {'raw': None, 'var': var, 'w': w}
+    
+      # position
+      key     = 'position'
+      fmt     = self.m_jointFieldFmt[key]
+      col     = self.m_jointFieldOrd.index(key)
+      justify = self.alignToJustify(fmt['align'])
+      var     = StringVar()
+      var.set('0.00')
+      w = Entry(wframe, relief='flat', justify=justify, textvar=var,
+                        fg=fgColors['normal'], bg=bg, readonlybackground=bg,
+                        width=fmt['width'], state='readonly')
+      w.grid(row=row, column=col, padx=padx, pady=pady, sticky=fmt['align'])
+      self.m_robotJoint[name][key] = {'raw': None, 'var': var, 'w': w}
+    
+      # odometer
+      key     = 'odometer'
+      fmt     = self.m_jointFieldFmt[key]
+      col     = self.m_jointFieldOrd.index(key)
+      justify = self.alignToJustify(fmt['align'])
+      var     = IntVar()
+      var.set(0)
+      w = Entry(wframe, relief='flat', justify=justify, textvar=var,
+                        fg=fgColors['normal'], bg=bg, readonlybackground=bg,
+                        width=fmt['width'], state='readonly')
+      w.grid(row=row, column=col, padx=padx, pady=pady, sticky=fmt['align'])
+      self.m_robotJoint[name][key] = {'raw': None, 'var': var, 'w': w}
+    
+      # encoder
+      key     = 'encoder'
+      fmt     = self.m_jointFieldFmt[key]
+      col     = self.m_jointFieldOrd.index(key)
+      justify = self.alignToJustify(fmt['align'])
+      var     = IntVar()
+      var.set(0)
+      w = Entry(wframe, relief='flat', justify=justify, textvar=var,
+                        fg=fgColors['normal'], bg=bg, readonlybackground=bg,
+                        width=fmt['width'], state='readonly')
+      w.grid(row=row, column=col, padx=padx, pady=pady, sticky=fmt['align'])
+      self.m_robotJoint[name][key] = {'raw': None, 'var': var, 'w': w}
+    
+      # velocity
+      key     = 'velocity'
+      fmt     = self.m_jointFieldFmt[key]
+      col     = self.m_jointFieldOrd.index(key)
+      justify = self.alignToJustify(fmt['align'])
+      var     = StringVar()
+      var.set('0.0')
+      w = Entry(wframe, relief='flat', justify=justify, textvar=var,
+                        fg=fgColors['normal'], bg=bg, readonlybackground=bg,
+                        width=fmt['width'], state='readonly')
+      w.grid(row=row, column=col, padx=padx, pady=pady, sticky=fmt['align'])
+      self.m_robotJoint[name][key] = {'raw': None, 'var': var, 'w': w}
+    
+      # raw speed
+      key     = 'speed'
+      fmt     = self.m_jointFieldFmt[key]
+      col     = self.m_jointFieldOrd.index(key)
+      justify = self.alignToJustify(fmt['align'])
+      var     = IntVar()
+      var.set(0)
+      w = Entry(wframe, relief='flat', justify=justify, textvar=var,
+                        fg=fgColors['normal'], bg=bg, readonlybackground=bg,
+                        width=fmt['width'], state='readonly')
+      w.grid(row=row, column=col, padx=padx, pady=pady, sticky=fmt['align'])
+      self.m_robotJoint[name][key] = {'raw': None, 'var': var, 'w': w}
+
+      # raw effort
+      key     = 'effort'
+      fmt     = self.m_jointFieldFmt[key]
+      col     = self.m_jointFieldOrd.index(key)
+      justify = self.alignToJustify(fmt['align'])
+      var     = IntVar()
+      var.set(0)
+      w = Entry(wframe, relief='flat', justify=justify, textvar=var,
+                        fg=fgColors['normal'], bg=bg, readonlybackground=bg,
+                        width=fmt['width'], state='readonly')
+      w.grid(row=row, column=col, padx=padx, pady=pady, sticky=fmt['align'])
+      self.m_robotJoint[name][key] = {'raw': None, 'var': var, 'w': w}
+    
+      # temperature
+      key     = 'temperature'
+      fmt     = self.m_jointFieldFmt[key]
+      col     = self.m_jointFieldOrd.index(key)
+      justify = self.alignToJustify(fmt['align'])
+      var     = IntVar()
+      var.set(0)
+      w = Entry(wframe, relief='flat', justify=justify, textvar=var,
+                        fg=fgColors['normal'], bg=bg, readonlybackground=bg,
+                        width=fmt['width'], state='readonly')
+      w.grid(row=row, column=col, padx=padx, pady=pady, sticky=fmt['align'])
+      self.m_robotJoint[name][key] = {'raw': None, 'var': var, 'w': w}
+    
+      # voltage
+      key     = 'voltage'
+      fmt     = self.m_jointFieldFmt[key]
+      col     = self.m_jointFieldOrd.index(key)
+      justify = self.alignToJustify(fmt['align'])
+      var     = StringVar()
+      var.set(0.0)
+      w = Entry(wframe, relief='flat', justify=justify, textvar=var,
+                        fg=fgColors['normal'], bg=bg, readonlybackground=bg,
+                        width=fmt['width'], state='readonly')
+      w.grid(row=row, column=col, padx=padx, pady=pady, sticky=fmt['align'])
+      self.m_robotJoint[name][key] = {'raw': None, 'var': var, 'w': w}
+    
+      # alarms
+      key     = 'alarms'
+      fmt     = self.m_jointFieldFmt[key]
+      col     = self.m_jointFieldOrd.index(key)
+      justify = self.alignToJustify(fmt['align'])
+      var     = StringVar()
+      var.set("ok")
+      w = Entry(wframe, relief='flat', justify=justify, textvar=var,
+                            fg=fgColors['ok'], bg=bg, readonlybackground=bg,
+                            width=fmt['width'], state='readonly')
+      w.grid(row=row, column=col, padx=padx, pady=pady, sticky=fmt['align'])
+      self.m_robotJoint[name][key] = {'raw': None, 'var': var, 'w': w}
+
+      #
+      # Slave servo
+      #
+      servoId = ord(joint.slave_servo_id[i])
+
+      if servoId != DYNA_ID_NONE:
+        row += 1
+
+        # joint
+        key = 'joint'
+        fmt = self.m_jointFieldFmt[key]
+        col = self.m_jointFieldOrd.index(key)
+        w = Label(wframe, bg=bg,
+                  anchor=fmt['align'], width=fmt['width'], text='')
+        w.grid(row=row, column=col, sticky=fmt['align'])
+        
+        # servo id
+        key     = 'servo_id'
+        fmt     = self.m_jointFieldFmt[key]
+        col     = self.m_jointFieldOrd.index(key)
+        justify = self.alignToJustify(fmt['align'])
+        var     = IntVar()
+        var.set(servoId)
+        w = Entry(wframe, relief='flat', justify=justify, textvar=var,
+                        fg=fgColors['normal'], bg=bg, readonlybackground=bg,
+                        width=fmt['width'], state='readonly')
+        w.grid(row=row, column=col, padx=padx, pady=pady, sticky=fmt['align'])
+        self.m_robotJoint[name][key+'_s'] = {'raw': servoId, 'var': var, 'w': w}
+        self.m_robotServo[servoId] = name
+    
+        # joint state (n/a)
+        key = 'state'
+        fmt = self.m_jointFieldFmt[key]
+        col = self.m_jointFieldOrd.index(key)
+        w = Entry(wframe, relief='flat',
+                        fg=fgColors['normal'], bg=bg, readonlybackground=bg,
+                        width=fmt['width'], state='readonly')
+        w.grid(row=row, column=col, padx=padx, pady=pady, sticky=fmt['align'])
+
+        # position (n/a)
+        key = 'position'
+        fmt = self.m_jointFieldFmt[key]
+        col = self.m_jointFieldOrd.index(key)
+        w = Entry(wframe, relief='flat',
+                        fg=fgColors['normal'], bg=bg, readonlybackground=bg,
+                        width=fmt['width'], state='readonly')
+        w.grid(row=row, column=col, padx=padx, pady=pady, sticky=fmt['align'])
+
+        # odometer (n/a)
+        key = 'odometer'
+        fmt = self.m_jointFieldFmt[key]
+        col = self.m_jointFieldOrd.index(key)
+        w = Entry(wframe, relief='flat',
+                        fg=fgColors['normal'], bg=bg, readonlybackground=bg,
+                        width=fmt['width'], state='readonly')
+        w.grid(row=row, column=col, padx=padx, pady=pady, sticky=fmt['align'])
+
+        # encoder (n/a)
+        key = 'encoder'
+        fmt = self.m_jointFieldFmt[key]
+        col = self.m_jointFieldOrd.index(key)
+        w = Entry(wframe, relief='flat',
+                        fg=fgColors['normal'], bg=bg, readonlybackground=bg,
+                        width=fmt['width'], state='readonly')
+        w.grid(row=row, column=col, padx=padx, pady=pady, sticky=fmt['align'])
+
+        # velocity (n/a)
+        key = 'velocity'
+        fmt = self.m_jointFieldFmt[key]
+        col = self.m_jointFieldOrd.index(key)
+        w = Entry(wframe, relief='flat',
+                        fg=fgColors['normal'], bg=bg, readonlybackground=bg,
+                        width=fmt['width'], state='readonly')
+        w.grid(row=row, column=col, padx=padx, pady=pady, sticky=fmt['align'])
+
+        # raw speed (n/a)
+        key = 'speed'
+        fmt = self.m_jointFieldFmt[key]
+        col = self.m_jointFieldOrd.index(key)
+        w = Entry(wframe, relief='flat',
+                        fg=fgColors['normal'], bg=bg, readonlybackground=bg,
+                        width=fmt['width'], state='readonly')
+        w.grid(row=row, column=col, padx=padx, pady=pady, sticky=fmt['align'])
+
+        # raw effort (n/a)
+        key = 'effort'
+        fmt = self.m_jointFieldFmt[key]
+        col = self.m_jointFieldOrd.index(key)
+        w = Entry(wframe, relief='flat',
+                        fg=fgColors['normal'], bg=bg, readonlybackground=bg,
+                        width=fmt['width'], state='readonly')
+        w.grid(row=row, column=col, padx=padx, pady=pady, sticky=fmt['align'])
+      
+        # temperature
+        key     = 'temperature'
+        fmt     = self.m_jointFieldFmt[key]
+        col     = self.m_jointFieldOrd.index(key)
+        justify = self.alignToJustify(fmt['align'])
+        var = IntVar()
+        var.set(0)
+        w = Entry(wframe, relief='flat', justify=justify, textvar=var,
+                          fg=fgColors['normal'], bg=bg, readonlybackground=bg,
+                          width=fmt['width'], state='readonly')
+        w.grid(row=row, column=col, padx=padx, pady=pady, sticky=fmt['align'])
+        self.m_robotJoint[name][key+'_s'] = {'raw': None, 'var': var, 'w': w}
+      
+        # voltage
+        key     = 'voltage'
+        fmt     = self.m_jointFieldFmt[key]
+        col     = self.m_jointFieldOrd.index(key)
+        justify = self.alignToJustify(fmt['align'])
+        var     = DoubleVar()
+        var.set(0.0)
+        w = Entry(wframe, relief='flat', justify=justify, textvar=var,
+                          fg=fgColors['normal'], bg=bg, readonlybackground=bg,
+                          width=fmt['width'], state='readonly')
+        w.grid(row=row, column=col, padx=padx, pady=pady, sticky=fmt['align'])
+        self.m_robotJoint[name][key+'_s'] = {'raw': None, 'var': var, 'w': w}
+      
+        # alarms
+        key     = 'alarms'
+        fmt     = self.m_jointFieldFmt[key]
+        col     = self.m_jointFieldOrd.index(key)
+        justify = self.alignToJustify(fmt['align'])
+        var     = StringVar()
+        var.set("ok")
+        w = Entry(wframe, relief='flat', justify=justify, textvar=var,
+                              fg=fgColors['ok'], bg=bg, readonlybackground=bg,
+                              width=fmt['width'], state='readonly')
+        w.grid(row=row, column=col, padx=padx, pady=pady, sticky=fmt['align'])
+        self.m_robotJoint[name][key+'_s'] = {'raw': None, 'var': var, 'w': w}
+
+      row += 1
+
+      self.update_idletasks()
+
+    self.m_bHasJointPanel = True
+    
+  #
+  ## \brief Create gui right hand side buttons.
+  #
+  def createRightButtons(self):
+    wframe = Frame(self)
+    wframe['borderwidth'] = 2
+    wframe['relief'] = 'ridge'
+    wframe.grid(row=1, column=2, padx=1, pady=3, sticky=N+W+E)
+
+    row = 0
+
+    # estop
+    w = self.createButton(wframe, "ESTOP", "icons/icon_estop.png", self.estop,
+                                  fg='red')
+    w.grid(row=row, column=0, sticky=N+E+W)
+    self.m_icons['estop_reset'] = \
+        self.m_imageLoader.load("icons/icon_estop_reset.png")
+
+    # freeze
+    row += 1
+    w = self.createButton(wframe, "Freeze",
+                                  "icons/icon_pause.png", self.freezeArm)
+    w.grid(row=row, column=0, sticky=N+E+W)
+    self.m_keysNoMoves.append('freeze')
+
+    # release
+    row += 1
+    w = self.createButton(wframe, "Release",
+                                  "icons/icon_stop.png", self.releaseArm)
+    w.grid(row=row, column=0, sticky=N+E+W)
+    self.m_keysNoMoves.append('release')
+
+    # clear alarms
+    row += 1
+    w = self.createButton(wframe, "Clear\nAlarms",
+                                  "icons/icon_alarm.png", self.clearAlarms)
+    w.grid(row=row, column=0, sticky=N+E+W)
+    self.m_keysNoMoves.append('clear_alarms')
+
+    # settings
+    row += 1
+    w = self.createButton(wframe, "Settings",
+                                  "icons/icon_settings.png", self.settingsPanel)
+    w.grid(row=row, column=0, sticky=N+E+W)
+
+    # info
+    row += 1
+    w = self.createButton(wframe, "About",
+                                  "icons/icon_info.png", self.about)
+    w.grid(row=row, column=0, sticky=N+E+W)
+
+    # quit
+    row += 1
+    w = self.createButton(wframe, "Quit", "icons/icon_exit.png", self.destroy,
+                                  fg='red')
+    w.grid(row=row, column=0, sticky=N+E+W)
+
+  #
+  ## \brief Create gui status bar at bottom of gui window.
+  #
+  def createStatusBar(self):
+    wframe = Frame(self)
+    wframe['borderwidth'] = 2
+    wframe['relief'] = 'ridge'
+    wframe.grid(row=2, column=0, columnspan=3, padx=1, pady=3, sticky=N+E+W+S)
+
+    self.m_varStatus = StringVar()
+    self.m_varStatus.set("Calibration required.")
+    self.m_wStatusBar = Entry(wframe)
+    self.m_wStatusBar['width']    = wframe['width']
+    self.m_wStatusBar['relief']   = 'flat'
+    self.m_wStatusBar['textvar']  = self.m_varStatus
+    self.m_wStatusBar['fg']       = fgColors['normal']
+    self.m_wStatusBar['state']    = 'readonly'
+    self.m_wStatusBar.grid(row=0, column=0, padx=3, pady=3, sticky=N+E+W+S)
+
+  #
+  ## \brief Update button activation states.
+  #
+  def updateButtonState(self, keys, state):
+    for key in keys:
+      self.m_wBttn[key]['state'] = state
+
+  #
+  ## \brief Create button.
+  ##
+  ## \param parent    Parent widget.
+  ## \param text      Button text.
+  ## \param imagefile Image file name. None for no image.
+  ## \param command   Callback for button push.
+  ## \param fg        Foreground text color.
+  ##
+  ## \return Button widget.
+  #
+  def createButton(self, parent, text, imagefile, command, fg='black'):
+    key = str.lower(text.replace("\n", "_"))
+    self.m_icons[key] = self.m_imageLoader.load(imagefile)
+    w = Button(parent)
+    w['text']     = text
+    if self.m_icons[key]:
+      w['image']    = self.m_icons[key]
+      w['compound'] = LEFT
+      w['padx']     = 0
+      w['pady']     = 0
+      w['anchor']   = W
+      w['width']    = 105
+    else:
+      w['anchor']   = CENTER
+      w['width']    = 10
+    w['fg']       = fg
+    w['command']  = command
+    self.m_wBttn[key] = w
+    return self.m_wBttn[key]
+
+  #
+  ## \brief Destroy window callback.
+  #
+  def destroy(self):
+    self.quit()
+
+  #
+  ## \brief Not implemented callback.
+  #
+  def notimpl(self):
+    emsg = "Window function not implemented yet."
+    self.showError(emsg)
+    print emsg
+
+  #
+  ## \brief (Cancel) calibration callback.
+  #
+  def calibrate(self):
+    # create calibration action client, if not already created
+    if self.m_calibState['ac'] is None:
+      self.m_calibState['ac'] = ACCalibrate()
+
+    # not calibrating - so start calibration
+    if not self.m_calibState['calibrating']:
+      if self.m_cfgPanel['warn_on_calib']:
+        dlg = WarnDlg(master=self,
+                      image="HekaterosZeroPt128.png",
+                      msg="""\
+For best calibration, place the Hekateros near the zero point.
+Make sure the workspace is clear of obstructions.""")
+        if not dlg.m_result:
+          #self.calibrate_cleanup()
+          return
+
+      self.m_calibState['calibrating'] = True
+      self.m_wBttn['calibrate']['image'] = self.m_icons['calibrate_cancel']
+      self.m_wBttn['calibrate']['text'] = "Cancel\nCalibrate"
+      self.showInfo("Calibrating Hekateros.")
+      self.update_idletasks()
+
+      # start calibration
+      if not self.m_calibState['ac'].exec_calib(self.calibrate_monitor,
+                                timeout=10.0,
+                                force_recalib=self.m_cfgPanel['force_recalib']):
+        self.showError("Could not execute calibration. " \
+                       "Is the hekateros_control node running?")
+        self.calibrate_cancel()
+
+      # check for completion
+      else:
+        self.m_calibState['id'] = self.after(100, self.calibrate_check_for_done)
+
+    # calibrating - so cancel
+    else:
+      self.calibrate_cancel()
+      self.showInfo("Calibration canceled.")
+
+    #self.calibrate_cleanup()
+      
+  #
+  ## \brief Cancel calibration, setting data and widget state accordingly.
+  #
+  def calibrate_cancel(self):
+    self.m_calibState['ac'].cancel()
+    self.m_calibState['calibrating'] = False
+    self.m_wBttn['calibrate']['image'] = self.m_icons['calibrate']
+    self.m_wBttn['calibrate']['text'] = "Calibrate"
+    if self.m_calibState['id'] != 0:
+      self.m_calibState['id'] = 0
+    self.showError("Calibration preempted.")
+    self.update_idletasks()
+
+  #
+  ## \brief Check if calibration is complete.
+  #
+  def calibrate_check_for_done(self):
+    state = self.m_calibState['ac'].get_action_state()
+    # acting
+    if  state == GoalStatus.PENDING or state == GoalStatus.ACTIVE or \
+        state == GoalStatus.PREEMPTING or state == GoalStatus.RECALLING:
+      self.m_calibState['id'] = self.after(100, self.calibrate_check_for_done)
+    # finished with abort or error
+    elif  state == GoalStatus.PREEMPTED or state == GoalStatus.REJECTED or \
+          state == GoalStatus.RECALLED or state == GoalStatus.ABORTED or \
+          state == GoalStatus.REJECTED:
+        self.m_wBttn['calibrate']['image'] = self.m_icons['calibrate']
+        self.m_wBttn['calibrate']['text'] = "Calibrate"
+        self.m_calibState['calibrating'] = False
+        self.m_calibState['id'] = 0
+        self.showError("Calibration aborted.")
+    # done
+    else:
+      self.m_wBttn['calibrate']['image'] = self.m_icons['calibrate']
+      self.m_wBttn['calibrate']['text'] = "Calibrate"
+      self.m_calibState['calibrating'] = False
+      self.m_calibState['id'] = 0
+      calib_state = self.m_calibState['ac'].get_result().op.calib_state
+      if calib_state == HekOpState.CALIBRATED:
+        self.showInfo("Calibration complete.")
+      else:
+        self.showError("Calibration failed.")
+      self.update_idletasks()
+
+  #
+  ## \brief Monitor the calibration feedback.
+  #
+  def calibrate_monitor(self, feedback):
+    pass
+
+  #
+  ## \brief Calibration cleanup.
+  #
+  def calibrate_cleanup(self):
+    # delete calibration action client, may be needed by other calib scripts
+    if self.m_calibState['ac'] is not None:
+      del self.m_calibState['ac']
+      self.m_calibState['ac'] = None
+  
+  #
+  ## \brief Go to parked position callback.
+  #
+  def gotoParkedPos(self):
+    try:
+      rospy.wait_for_service("hekateros_control/goto_parked", timeout=5)
+    except rospy.ROSException, e:
+      self.showError('Goto parked position: ' + e.message + '.')
+      return
+    try:
+      goto_parked_pos = rospy.ServiceProxy('hekateros_control/goto_parked', 
+                                        GotoParkedPos)
+      goto_parked_pos()
+    except rospy.ServiceException, e:
+      self.showError("Goto parked position request failed: %s." % (e.message))
+      return
+    self.showInfo("Parked.")
+  
+  #
+  ## \brief Go to balanced position callback.
+  #
+  def gotoBalancedPos(self):
+    try:
+      rospy.wait_for_service("hekateros_control/goto_balanced", timeout=5)
+    except rospy.ROSException, e:
+      self.showError('Goto balanced position: ' + e.message + '.')
+      return
+    try:
+      goto_balanced_pos = rospy.ServiceProxy(
+                                        'hekateros_control/goto_balanced', 
+                                        GotoBalancedPos)
+      goto_balanced_pos()
+    except rospy.ServiceException, e:
+      self.showError("Goto balanced position request failed: %s." % (e.message))
+      return
+    self.showInfo("Balanced.")
+  
+  #
+  ## \brief Go to zero point position callback.
+  #
+  def gotoZeroPt(self):
+    try:
+      rospy.wait_for_service("hekateros_control/goto_zero", timeout=5)
+    except rospy.ROSException, e:
+      self.showError('Goto zero point: ' + e.message + '.')
+      return
+    try:
+      goto_zero_pt = rospy.ServiceProxy('hekateros_control/goto_zero', 
+                                        GotoZeroPt)
+      goto_zero_pt()
+    except rospy.ServiceException, e:
+      self.showError("Goto zero point failed: %s." % (e.message))
+      return
+    self.showInfo("Zero point.")
+  
+  #
+  ## \brief Open gripper callback.
+  #
+  def openGripper(self):
+    try:
+      rospy.wait_for_service("hekateros_control/open_gripper", timeout=5)
+    except rospy.ROSException, e:
+      self.showError('Open gripper: ' + e.message + '.')
+      return
+    try:
+      open_gripper = rospy.ServiceProxy('hekateros_control/open_gripper', 
+                                        OpenGripper)
+      open_gripper()
+    except rospy.ServiceException, e:
+      self.showError("Open grippper request failed: %s." % (e.message))
+      return
+    self.showInfo("Gripper opened.")
+  
+
+  #
+  ## \brief Close gripper callback.
+  #
+  def closeGripper(self):
+    try:
+      rospy.wait_for_service("hekateros_control/close_gripper", timeout=5)
+    except rospy.ROSException, e:
+      self.showError('Close gripper: ' + e.message + '.')
+      return
+    try:
+      close_gripper = rospy.ServiceProxy('hekateros_control/close_gripper',
+                                          CloseGripper)
+      close_gripper()
+    except rospy.ServiceException, e:
+      self.showError("Close grippper request failed: %s." % (e.message))
+      return
+    self.showInfo("Gripper closed.")
+
+  #
+  ## \brief Specify move callback.
+  #
+  def specifyMove(self):
+    jointTrajectory  = trajectory_msgs.msg.JointTrajectory()
+    jointTrajPoint   = trajectory_msgs.msg.JointTrajectoryPoint()  
+    jointTrajectory.points.append(jointTrajPoint)
+    for name,val in self.m_robotJoint.iteritems(): 
+      jointTrajectory.joint_names.append(name)
+      pos = self.m_robotJoint[name]['position']['raw']
+      jointTrajPoint.positions.append(pos)
+      jointTrajPoint.velocities.append(degToRad(0.0))
+      jointTrajPoint.accelerations.append(0.0)
+    dlg = MoveDlg(master=self, image='HekaterosInMotion.png',
+                                trajectory=jointTrajectory)
+    if dlg.m_result:
+      self.moveRobot(dlg.m_resultTraj)
+  
+  #
+  ## \brief Move robot along trajectory.
+  #
+  def moveRobot(self, trajectory):
+    try:
+      self.m_joint_cmd_pub.publish(trajectory)
+      self.showInfo('Move on specified trajectory.')
+    except rospy.ROSException, e:
+      self.showError('joint_command: ' + e.message + '.')
+
+  #
+  ## \brief (Reset) emergency stop callback.
+  #
+  def estop(self):
+    if self.m_robotStatus['estop_led']['raw'] == TriState.FALSE:
+      self.showResetEStop()
+      try:
+        rospy.wait_for_service("hekateros_control/estop", timeout=5)
+      except rospy.ROSException, e:
+        self.showError('Emergency stop: ' + e.message + '.')
+        self.showEStop()
+        return
+      try:
+        estop = rospy.ServiceProxy('hekateros_control/estop',
+                                          EStop)
+        estop()
+      except rospy.ServiceException, e:
+        self.showError("Emergency stop request failed: %s." % (e.message))
+        self.showEStop()
+        return
+      self.showError("Hekateros emergency stopped.")
+    else:
+      self.showEStop()
+      try:
+        rospy.wait_for_service("hekateros_control/reset_estop", timeout=5)
+      except rospy.ROSException, e:
+        self.showError('Reset emergency stop: ' + e.message + '.')
+        self.showResetEStop()
+        return
+      try:
+        reset_estop = rospy.ServiceProxy('hekateros_control/reset_estop',
+                                          ResetEStop)
+        reset_estop()
+      except rospy.ServiceException, e:
+        self.showError("Reset emergency stop request failed: %s." % (e.message))
+        self.showResetEStop()
+        return
+      self.showInfo("Hekateros emergency stop has been reset.")
+  
+  #
+  ## \brief Show estop button.
+  #
+  def showEStop(self):
+    self.m_wBttn['estop']['image'] = self.m_icons['estop']
+    self.m_wBttn['estop']['text']   = "ESTOP"
+    self.m_wBttn['estop']['fg']     = fgColors['error']
+    self.update_idletasks()
+
+  #
+  ## \brief Show reset estop button.
+  #
+  def showResetEStop(self):
+    self.m_wBttn['estop']['image']  = self.m_icons['estop_reset']
+    self.m_wBttn['estop']['text']   = "Reset\nESTOP"
+    self.m_wBttn['estop']['fg']     = fgColors['normal']
+    self.update_idletasks()
+
+  #
+  ## \brief Freeze arm callback.
+  #
+  def freezeArm(self):
+    try:
+      rospy.wait_for_service("hekateros_control/freeze", timeout=5)
+    except rospy.ROSException, e:
+      self.showError('Freeze arm: ' + e.message + '.')
+      return
+    try:
+      freeze = rospy.ServiceProxy('hekateros_control/freeze', Freeze)
+      freeze()
+    except rospy.ServiceException, e:
+      self.showError("Freeze arm request failed: %s." % (e.message))
+      return
+    self.showInfo("Hekateros has been frozen at current position.")
+
+  #
+  ## \brief Release arm callback.
+  #
+  def releaseArm(self):
+    if self.m_cfgPanel['warn_on_release']:
+      dlg = WarnDlg(master=self,
+                    image="HekFalling.png",
+                    msg="""\
+The Hekateros motros will become unpowered.
+The arm may fall if not in a stable position.""")
+      if not dlg.m_result:
+        return
+    try:
+      rospy.wait_for_service("hekateros_control/release", timeout=5)
+    except rospy.ROSException, e:
+      self.showError('Release arm: ' + e.message + '.')
+      return
+    try:
+      release = rospy.ServiceProxy('hekateros_control/release', Release)
+      release()
+    except rospy.ServiceException, e:
+      self.showError("Release arm request failed: %s." % (e.message))
+      return
+    self.showInfo("Hekateros has been release, all motors are unpowered.")
+
+  #
+  ## \brief Clear alarms callback.
+  #
+  def clearAlarms(self):
+    try:
+      rospy.wait_for_service("hekateros_control/clear_alarms", timeout=5)
+    except rospy.ROSException, e:
+      self.showError('Clear alarms: ' + e.message + '.')
+      return
+    try:
+      clear_alarms = rospy.ServiceProxy('hekateros_control/clear_alarms',
+                                          ClearAlarms)
+      clear_alarms()
+    except rospy.ServiceException, e:
+      self.showError("Clear alarms request failed: %s." % (e.message))
+      return
+    self.showInfo("Alarms cleared.")
+  
+  #
+  ## \brief Open panel settings dialog callback.
+  #
+  def settingsPanel(self):
+    dlg = PanelConfigDlg(master=self, config=self.m_cfgPanel)
+    if dlg.m_errors:
+      self.showError(dlg.m_errmsg+'.')
+    elif dlg.m_saved:
+      self.m_cfgPanel = dlg.m_config.copy()
+      self.showInfo("Configuration saved to %s." % (dlg.m_filename))
+    else:
+      self.showInfo("Canceled.")
+  
+  #
+  ## \brief Open end effector camera settings dialog callback.
+  #
+  def settingsEECam(self):
+    dlg = EECamConfigDlg(master=self, config=self.m_cfgEECam)
+    if dlg.m_errors:
+      self.showError(dlg.m_errmsg+'.')
+    elif dlg.m_saved:
+      self.m_cfgEECam = dlg.m_config.copy()
+      self.showInfo("Configuration saved to %s." % (dlg.m_filename))
+    else:
+      self.showInfo("Canceled.")
+  #
+  ## \brief Open Xbox teleoperation settings dialog callback.
+  #
+  def settingsXbox(self):
+    config = self.readXboxConfig().copy()
+    dlg = XboxConfigDlg(master=self, config=config)
+    if dlg.m_errors:
+      self.showError(dlg.m_errmsg+'.')
+    elif dlg.m_saved:
+      self.showInfo("Configuration saved to %s." % (dlg.m_filename))
+    else:
+      self.showInfo("Canceled.")
+  
+  #
+  ## \brief Start end effector camera.
+  #
+  def startEECam(self):
+    dlg = EECamStartDlg(master=self, src=self.m_hekName, config=self.m_cfgEECam)
+  
+  #
+  ## \brief Stop end effector camera.
+  #
+  def stopEECam(self):
+    dlg = EECamStopDlg(master=self, src=self.m_hekName)
+  
+  #
+  ## \brief Show ROS infot dialog callback.
+  #
+  def ROSInfo(self):
+    dlg = ROSInfoDlg(master=self)
+  
+  #
+  ## \brief Show about dialog callback.
+  #
+  def about(self):
+    prodInfo = self.getProductInfo()
+    dlg = AboutDlg(master=self, info=prodInfo, app_ver=appVersion)
+  
+  #
+  ## \brief Get product information.
+  ## 
+  ## \return Returns product information on success, None on failure.
+  #
+  def getProductInfo(self):
+    prodInfo = None
+    try:
+      rospy.wait_for_service("hekateros_control/get_product_info", timeout=5)
+    except rospy.ROSException, e:
+      self.showError('Get product info: ' + e.message + '.')
+    else:
+      try:
+        get_product_info = rospy.ServiceProxy(
+                                          'hekateros_control/get_product_info',
+                                          GetProductInfo)
+        rsp = get_product_info()
+        prodInfo = rsp.i
+      except rospy.ServiceException, e:
+        self.showError("Get product info request failed: %s." % (e.message))
+    return prodInfo
+
+  #
+  ## \brief Get Hekateros name.
+  ## 
+  ## \return Returns name.
+  #
+  def getHekaterosName(self):
+    name = "hekateros"
+    try:
+      rospy.wait_for_service("hekateros_control/get_product_info", timeout=5)
+    except rospy.ROSException, e:
+      rospy.logerr("Get product info: %s." % (e.message))
+    else:
+      try:
+        get_product_info = rospy.ServiceProxy(
+                                          'hekateros_control/get_product_info',
+                                          GetProductInfo)
+        rsp = get_product_info()
+        name = rsp.i.hostname
+      except rospy.ServiceException, e:
+        rospy.logerr("Get product info request failed: %s." % (e.message))
+    return name
+
+  #
+  ## \brief Update robot status.
+  ##
+  ## \param status  Robot status extended message.
+  #
+  def updateRobotStatus(self, status):
+    self.showRobotStatus(status)
+
+    # first update of joint state required first
+    if self.m_bHasJointPanel:
+      self.showServoHealth(status.servo_health)
+
+  #
+  ## \brief Update joint state.
+  ##
+  ## \param joint  Joint state extended message.
+  #
+  def updateJointStates(self, joint):
+    # no joints
+    if len(joint.name) == 0:
+      return
+
+    # first state message, 
+    if not self.m_bHasJointPanel:
+      self.createJointStatePanel(joint)
+
+    self.showJointStates(joint)
+
+  #
+  ## \brief Show robot status.
+  ##
+  ## \param status  Robot status extended message.
+  #
+  def showRobotStatus(self, status):
+    if status.mode.val == RobotMode.MANUAL or \
+      status.e_stopped.val == TriState.TRUE or \
+      status.is_calibrated.val == TriState.FALSE:
+      bNoMoves = True
+    else:
+      bNoMoves = False
+
+    key = 'mode'
+    if self.m_robotStatus[key]['raw'] != status.mode.val:
+      self.m_robotStatus[key]['raw'] = status.mode.val
+      text, fg = self.toRobotMode(status.mode.val)
+      self.showEntry(self.m_robotStatus[key]['w'],
+          self.m_robotStatus[key]['var'], text, fg)
+      if bNoMoves:
+        state = 'disabled'
+      else:
+        state = 'normal'
+      self.updateButtonState(self.m_keysNoMoves, state)
+
+    key = 'calibration'
+    if self.m_robotStatus[key]['raw'] != status.is_calibrated.val:
+      self.m_robotStatus[key]['raw'] = status.is_calibrated.val
+      text, fg = self.toCalib(status.is_calibrated.val)
+      self.showEntry(self.m_robotStatus[key]['w'],
+          self.m_robotStatus[key]['var'], text, fg)
+      if status.is_calibrated.val == TriState.TRUE:
+        state = 'normal'
+      else:
+        state = 'disabled'
+      if not bNoMoves:
+        self.updateButtonState(self.m_keysFewMoves, state)
+
+    key = 'motors_led'
+    if self.m_robotStatus[key]['raw'] != status.drives_powered.val:
+      self.m_robotStatus[key]['raw'] = status.drives_powered.val
+      if status.drives_powered.val == TriState.ON:
+        self.m_robotStatus[key]['w']['image'] = self.m_icons['led_green'] 
+      else:
+        self.m_robotStatus[key]['w']['image'] = self.m_icons['led_dark'] 
+
+    key = 'moving_led'
+    if self.m_robotStatus[key]['raw'] != status.in_motion.val:
+      self.m_robotStatus[key]['raw'] = status.in_motion.val
+      if status.in_motion.val == TriState.ON:
+        self.m_robotStatus[key]['w']['image'] = self.m_icons['led_green'] 
+      else:
+        self.m_robotStatus[key]['w']['image'] = self.m_icons['led_dark'] 
+
+    key = 'alarms_led'
+    if self.m_robotStatus[key]['raw'] != status.in_error.val:
+      self.m_robotStatus[key]['raw'] = status.in_error.val
+      if status.in_error.val == TriState.TRUE:
+        self.m_robotStatus[key]['w']['image'] = self.m_icons['led_red'] 
+      else:
+        self.m_robotStatus[key]['w']['image'] = self.m_icons['led_dark'] 
+
+    key = 'estop_led'
+    if self.m_robotStatus[key]['raw'] != status.e_stopped.val:
+      self.m_robotStatus[key]['raw'] = status.e_stopped.val
+      if status.e_stopped.val == TriState.TRUE:
+        self.m_robotStatus[key]['w']['image'] = self.m_icons['led_red'] 
+      else:
+        self.m_robotStatus[key]['w']['image'] = self.m_icons['led_dark'] 
+      if bNoMoves:
+        state = 'disabled'
+      else:
+        state = 'normal'
+      self.updateButtonState(self.m_keysNoMoves, state)
+
+  #
+  ## \brief Show joint state.
+  ##
+  ## \param joint  Joint state extended message.
+  #
+  def showJointStates(self, joint):
+    for i in range(0, len(joint.name)):
+      name = joint.name[i]
+      if not self.m_robotJoint.has_key(name):
+        continue
+
+      #
+      # Master servo
+      #
+      key = 'state'
+      val = joint.op_state[i].calib_state
+      if self.m_robotJoint[name][key]['raw'] != val:
+        self.m_robotJoint[name][key]['raw'] = val
+        text, fg = self.toJointState(val)
+        self.showEntry(self.m_robotJoint[name][key]['w'],
+                     self.m_robotJoint[name][key]['var'], text, fg)
+
+      key = 'position'
+      val = joint.position[i]
+      if self.m_robotJoint[name][key]['raw'] != val:
+        self.m_robotJoint[name][key]['raw'] = val
+        pos, fg = self.toDeg(val)
+        self.showEntry(self.m_robotJoint[name][key]['w'],
+                     self.m_robotJoint[name][key]['var'], pos, fg)
+
+      key = 'odometer'
+      val = joint.odometer_pos[i]
+      if self.m_robotJoint[name][key]['raw'] != val:
+        self.m_robotJoint[name][key]['raw'] = val
+        self.showEntry(self.m_robotJoint[name][key]['w'],
+                     self.m_robotJoint[name][key]['var'],
+                     val, fgColors['normal'])
+
+      key = 'encoder'
+      val = joint.encoder_pos[i]
+      if self.m_robotJoint[name][key]['raw'] != val:
+        self.m_robotJoint[name][key]['raw'] = val
+        self.showEntry(self.m_robotJoint[name][key]['w'],
+                     self.m_robotJoint[name][key]['var'],
+                     val, fgColors['normal'])
+
+      key = 'velocity'
+      val = joint.velocity[i]
+      if self.m_robotJoint[name][key]['raw'] != val:
+        self.m_robotJoint[name][key]['raw'] = val
+        vel, fg = self.toDeg(val, "%.1f")
+        self.showEntry(self.m_robotJoint[name][key]['w'],
+                     self.m_robotJoint[name][key]['var'], vel, fg)
+
+      key = 'speed'
+      val = joint.raw_speed[i]
+      if self.m_robotJoint[name][key]['raw'] != val:
+        self.m_robotJoint[name][key]['raw'] = val
+        self.showEntry(self.m_robotJoint[name][key]['w'],
+                     self.m_robotJoint[name][key]['var'],
+                     val, fgColors['normal'])
+
+      key = 'effort'
+      val = joint.effort[i]
+      if self.m_robotJoint[name][key]['raw'] != val:
+        self.m_robotJoint[name][key]['raw'] = val
+        load, fg = self.toEffort(joint.effort[i])
+        self.showEntry(self.m_robotJoint[name][key]['w'],
+                     self.m_robotJoint[name][key]['var'], load, fg)
+
+      #
+      # Slave servo
+      #
+      #if self.m_robotJoint[name].has_key('servo_id_s'):
+        #key = 'encoder_s'
+        #val = joint.encoder_pos[i]
+        #if self.m_robotJoint[name][key]['raw'] != val:
+        #  self.m_robotJoint[name][key]['raw'] = val
+        #  self.showEntry(self.m_robotJoint[name][key]['w'],
+        #               self.m_robotJoint[name][key]['var'],
+        #               val, fgColors['normal'])
+  
+        #key = 'effort_s'
+        #val, fg = self.toEffort(joint.effort[i])
+        #if self.m_robotJoint[name][key]['raw'] != val:
+        #  self.m_robotJoint[name][key]['raw'] = val
+        #  self.showEntry(self.m_robotJoint[name][key]['w'],
+        #               self.m_robotJoint[name][key]['var'], val, fg)
+
+  #
+  ## \brief Show servo health.
+  ##
+  ## \param health  Servo health message.
+  #
+  def showServoHealth(self, health):
+    for i in range(0, len(health)):
+      servo_id = health[i].servo_id
+      if not self.m_robotServo.has_key(servo_id):
+        continue
+
+      name = self.m_robotServo[servo_id]
+
+      #
+      # Master servo
+      #
+      if self.m_robotJoint[name]['servo_id']['raw'] == servo_id:
+        key = 'temperature'
+        val = health[i].temp
+        if self.m_robotJoint[name][key]['raw'] != val:
+          self.m_robotJoint[name][key]['raw'] = val
+          temp, fg = self.toTemperatureColor(val)
+          self.showEntry(self.m_robotJoint[name][key]['w'],
+                         self.m_robotJoint[name][key]['var'], temp, fg)
+  
+        key = 'voltage'
+        val = health[i].voltage
+        if self.m_robotJoint[name][key]['raw'] != val:
+          self.m_robotJoint[name][key]['raw'] = val
+          volts, fg = self.toVoltage(val)
+          self.showEntry(self.m_robotJoint[name][key]['w'],
+                         self.m_robotJoint[name][key]['var'], volts, fg)
+  
+        key = 'alarms'
+        val = health[i].alarm
+        if self.m_robotJoint[name][key]['raw'] != val:
+          self.m_robotJoint[name][key]['raw'] = val
+          alarms, fg = self.toAlarms(val)
+          self.showEntry(self.m_robotJoint[name][key]['w'],
+                         self.m_robotJoint[name][key]['var'], alarms, fg)
+
+      #
+      # Slave servo
+      #
+      elif self.m_robotJoint[name].has_key('servo_id_s') and \
+           self.m_robotJoint[name]['servo_id_s']['raw'] == servo_id:
+        key = 'temperature_s'
+        val = health[i].temp
+        if self.m_robotJoint[name][key]['raw'] != val:
+          self.m_robotJoint[name][key]['raw'] = val
+          temp, fg = self.toTemperatureColor(val)
+          self.showEntry(self.m_robotJoint[name][key]['w'],
+                         self.m_robotJoint[name][key]['var'], temp, fg)
+  
+        key = 'voltage_s'
+        val = health[i].voltage
+        if self.m_robotJoint[name][key]['raw'] != val:
+          self.m_robotJoint[name][key]['raw'] = val
+          volts, fg = self.toVoltage(val)
+          self.showEntry(self.m_robotJoint[name][key]['w'],
+                         self.m_robotJoint[name][key]['var'], volts, fg)
+  
+        key = 'alarms_s'
+        val = health[i].alarm
+        if self.m_robotJoint[name][key]['raw'] != val:
+          self.m_robotJoint[name][key]['raw'] = val
+          alarms, fg = self.toAlarms(health[i].alarm)
+          self.showEntry(self.m_robotJoint[name][key]['w'],
+                         self.m_robotJoint[name][key]['var'], alarms, fg)
+
+  #
+  ## \brief Show information message on status bar.
+  ##
+  ## \param msg   Info message string.
+  #
+  def showInfo(self, msg):
+    self.m_wStatusBar["state"] = "normal"
+    self.m_wStatusBar["fg"]    = fgColors['normal']
+    self.m_varStatus.set(msg)
+    self.m_wStatusBar["state"] = "readonly"
+
+  #
+  ## \brief Show error message on status bar.
+  ##
+  ## \param msg   Error message string.
+  #
+  def showError(self, msg):
+    self.m_wStatusBar["state"] = "normal"
+    self.m_wStatusBar["fg"]    = fgColors['error']
+    self.m_varStatus.set(msg)
+    self.m_wStatusBar["state"] = "readonly"
+
+  #
+  ## \brief Show text on read-only entry.
+  ##
+  ## \param w     Entry widget.
+  ## \param var   Bound entry variable.
+  ## \param val   Variable value.
+  ## \param fg    Text foreground color.
+  #
+  def showEntry(self, w, var, val, fg='black'):
+    w['state'] = 'normal'
+    w['fg']    = fg
+    var.set(val)
+    w['state'] = 'readonly'
+
+  #
+  ## \brief Map alignment value to justify equivalent.
+  ##
+  ## \param align   Alignment.
+  ## 
+  ## \return Tk justify.
+  #
+  def alignToJustify(self, align):
+    if align == W:
+      return LEFT
+    elif align == E:
+      return RIGHT
+    else:
+      return CENTER
+
+  #
+  ## \brief Map robot mode for display.
+  ## 
+  ## \param mode    Robot mode.
+  ## 
+  ## \return string, color
+  #
+  def toRobotMode(self, mode):
+    if mode == RobotMode.MANUAL:
+      return ("Manual", fgColors['warning'])
+    elif mode == RobotMode.AUTO:
+      return ("Auto", fgColors['normal'])
+    else:
+      return (repr(mode), fgColors['error'])
+
+  #
+  ## \brief Map calibration state for display.
+  ##
+  ## \param tristate    Tri-state value.
+  ## 
+  ## \return string, color
+  #
+  def toCalib(self, tristate):
+    if tristate == TriState.FALSE:
+      return ("Uncalibrated", fgColors['error'])
+    elif tristate == TriState.TRUE:
+      return ("Calibrated", fgColors['normal'])
+    else:
+      return (repr(tristate), fgColors['error'])
+
+  #
+  ## \brief Map powered motors state for display.
+  ##
+  ## \param tristate    Tri-state value.
+  ## 
+  ## \return string, color
+  #
+  def toMotorsPowered(self, tristate):
+    if tristate == TriState.FALSE:
+      return ("Unpowered", fgColors['normal'])
+    elif tristate == TriState.TRUE:
+      return ("Powered", fgColors['normal'])
+    else:
+      return (repr(tristate), fgColors['error'])
+
+  #
+  ## \brief Map joint calibration state for display.
+  ##
+  ## \param opstate     Calibration operation state.
+  ## 
+  ## \return string, color
+  #
+  def toJointState(self, opstate):
+      if opstate == HekOpState.UNCALIBRATED:
+        return ("uncalibrated", fgColors['error'])
+      elif opstate == HekOpState.CALIBRATING:
+        return ("calibrating", fgColors['focus'])
+      elif opstate == HekOpState.CALIBRATED:
+        return ("calibrated", fgColors['normal'])
+      else:
+        return (repr(opstate), fgColors['error'])
+
+  #
+  ## \brief Map radians to degrees for display.
+  ##
+  ## \param rad    Radians.
+  ## \param fmt    Format.
+  ## 
+  ## \return string, color
+  #
+  def toDeg(self, rad, fmt="%.2f"):
+    deg = math.degrees(rad)
+    return fmt % (deg), fgColors['normal']
+
+  #
+  ## \brief Map servo effort for display.
+  ##
+  ## \param effor   Servo effort (raw).
+  ## 
+  ## \return string, color
+  #
+  def toEffort(self, effort):
+    absraw = math.fabs(effort)
+    raw    = int(effort)
+    if absraw < 900:
+      return (raw, fgColors['normal'])
+    elif absraw < 1000:
+      return (raw, fgColors['warning'])
+    else:
+      return (raw, fgColors['error'])
+
+  #
+  ## \brief Map temperature for display.
+  ##
+  ## \param temp    Temperature (C).
+  ## 
+  ## \return string, color
+  #
+  def toTemperatureColor(self, temp):
+    raw = int(temp)
+    if temp >= 75:
+      return (raw, fgColors['error'])
+    elif temp >= 60:
+      return (raw, fgColors['warning'])
+    else:
+      return (raw, fgColors['normal'])
+
+  #
+  ## \brief Map voltage for display.
+  ##
+  ## \param volts   Voltage.
+  ## 
+  ## \return string, color
+  #
+  def toVoltage(self, volts):
+    if volts >= 10.5 and volts <= 13.0:
+      fg = fgColors['normal']
+    elif volts >= 9.5 and volts <= 13.5:
+      fg = fgColors['warning']
+    else:
+      fg = fgColors['error']
+    return "%.1f" % (volts), fg
+
+  #
+  ## \brief Map alarms for display.
+  ##
+  ## \param alarms    Alarm bits.
+  ## 
+  ## \return string, color
+  #
+  def toAlarms(self, alarms):
+    if alarms == ServoHealth.ALARM_NONE:
+      return (alarmStrings[ServoHealth.ALARM_NONE], fgColors['ok'])
+    text = ""
+    sep  = ""
+    for bit in alarmStrings.keys():
+      if bit & alarms:
+        if len(alarmStrings[bit]) > 0:
+          text += sep + alarmStrings[bit]
+          sep = ','
+    return (text, fgColors['error'])
+
+  #
+  ## \brief Read panel configuration.
+  ##
+  ## Any data not read or set to defaults.
+  #
+  def readPanelConfig(self):
+    xml = PanelConfigXml()
+    self.m_cfgPanel = xml.parse()
+
+  #
+  ## \brief Read end effector camera configuration.
+  ##
+  ## Any data not read or set to defaults.
+  #
+  def readEECamConfig(self):
+    xml = EECamConfigXml()
+    self.m_cfgEECam = xml.parse()
+
+  #
+  ## \brief Read Xbox teleop configuration.
+  ##
+  ## Any data not read or set to defaults.
+  #
+  def readXboxConfig(self):
+    xml = XboxConfigXml()
+    return xml.parse()
+
+  #
+  ## \brief Final window initializations.
+  ##
+  ## Both the window data and widgets, along with ROS node application, have
+  ## been fully initialized.
+  #
+  def finalInits(self):
+    self.m_hekName   = self.getHekaterosName()
+    rosMaster = whichROSMaster()
+    self.master.title("Hekateros Control Panel - %s" % (self.m_hekName))
+    self.m_wTopHeading['text'] = "Hekateros Control Panel - %s" % \
+        (self.m_hekName)
+
+
+# ------------------------------------------------------------------------------
+# Exception Class usage
+# ------------------------------------------------------------------------------
+
+##
+## \brief Unit test command-line exception class.
+##
+## Raise usage excpetion.
+##
+class usage(Exception):
+
+  ##
+  ## \brief Constructor.
+  ##
+  ## \param msg   Error message string.
+  ##
+  def __init__(self, msg):
+    ## error message attribute
+    self.msg = msg
+
+
+# ------------------------------------------------------------------------------
+# Class application
+# ------------------------------------------------------------------------------
+
+##
+## \brief Hekateros control panel.
+##
+class application():
+
+  #
+  ## \brief Constructor.
+  #
+  def __init__(self):
+    self._Argv0 = os.path.basename(__file__)
+    self.m_win = None
+
+  #
+  ## \brief Print usage error.
+  ##
+  ## \param emsg  Error message string.
+  #
+  def printUsageErr(self, emsg):
+    if emsg:
+      print "%s: %s" % (self._Argv0, emsg)
+    else:
+      print "%s: error" % (self._Argv0)
+    print "Try '%s --help' for more information." % (self._Argv0)
+
+  ## \brief Print Command-Line Usage Message.
+  def printUsage(self):
+    print \
+"""
+usage: %s [OPTIONS]
+       %s --help
+
+Options and arguments:
+-h, --help                : Display this help and exit.
+"""  % (self._Argv0, self._Argv0)
+ 
+  #
+  ## \brief Get command-line options
+  ##  
+  ## \param argv          Argument list. If not None, then overrides
+  ##                      command-line arguments.
+  ## \param [out] kwargs  Keyword argument list.  
+  ##
+  ## \return Parsed keyword arguments.
+  #
+  def getOptions(self, argv=None, **kwargs):
+    if argv is None:
+      argv = sys.argv
+
+    self._Argv0 = os.path.basename(kwargs.get('argv0', __file__))
+
+    # defaults
+    kwargs['debug'] = False
+
+    # parse command-line options
+    try:
+      opts, args = getopt.getopt(argv[1:], "?h",
+          ['help', ''])
+    except getopt.error, msg:
+      raise usage(msg)
+    for opt, optarg in opts:
+      if opt in ('-h', '--help', '-?'):
+        self.printUsage()
+        sys.exit(0)
+
+    #if len(args) < 1:
+    #  self.printUsageErr("No input xml file specified")
+    #  sys.exit(2)
+    #else:
+    #  kwargs['filename'] = args[0]
+
+    return kwargs
+
+  #
+  ## \brief Initialize interface to hek_robot.
+  #
+  def initRobot(self):
+    self.m_win.showInfo("Initializing interface to Hekateros.")
+
+    # initialize ROS node, connecting with ROS master
+    rospy.init_node("hek_panel")
+
+    # subscribe to extended robot status data
+    rospy.Subscriber("hekateros_control/robot_status_ex", 
+                     HekRobotStatusExtended, 
+                     self.m_win.updateRobotStatus) 
+
+    # subscribe to extended joint state data
+    rospy.Subscriber("hekateros_control/joint_states_ex", 
+                     HekJointStateExtended, 
+                     self.m_win.updateJointStates) 
+
+    # publish trajectory to hekateros controller
+    self.m_win.m_joint_cmd_pub = rospy.Publisher(
+        "hekateros_control/joint_command",
+        trajectory_msgs.msg.JointTrajectory,
+        queue_size=2)
+
+    self.m_win.showInfo("Hekateros interface initialized.")
+
+  #
+  ## \brief Run application.
+  ##    
+  ## \param argv    Optional argument list to override command-line arguments.
+  ## \param kwargs  Optional keyword argument list.
+  ##
+  ## \return Exit code.
+  #
+  def run(self, argv=None, **kwargs):
+  
+    # parse command-line options and arguments
+    try:
+      kwargs = self.getOptions(argv, **kwargs)
+    except usage, e:
+      print e.msg
+      return 2
+
+    # create root 
+    root = Tk()
+
+    # create application window
+    self.m_win = window(master=root)
+
+    # destroy window on 'x'
+    root.protocol('WM_DELETE_WINDOW', root.destroy)
+
+    root.columnconfigure(0, weight=1)
+    root.rowconfigure(0, weight=1)
+
+    # initialize robot interface
+    self.initRobot()
+
+    # do any final initializations
+    self.m_win.finalInits()
+
+    # go for it
+    self.m_win.mainloop()
+
+    return 0
+
+
+# ------------------------------------------------------------------------------
+# main
+# ------------------------------------------------------------------------------
+if __name__ == '__main__':
+  app = application();
+  sys.exit( app.run() );

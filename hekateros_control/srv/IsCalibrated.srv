@@ -1,0 +1,4 @@
+# Hekateros hekateros_control/IsCalibrated service
+
+---
+bool is_calibrated    # robot is [not] calibrated
